@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/rivoui.tsx","./src/index.ts","./src/main.tsx","./src/vite-env.d.ts","./src/api/client.ts","./src/pages/dashboard.tsx","./src/pages/jobs.tsx","./src/pages/queues.tsx","./src/pages/schedules.tsx","./src/pages/workflowrundetail.tsx","./src/pages/workflowruns.tsx","./src/pages/workflows.tsx"],"version":"5.6.3"}
