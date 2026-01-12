@@ -23,7 +23,8 @@
 |---------|-------------|
 | **Postgres-native** | No Redis or Kafka needed, just Postgres |
 | **Durable jobs** | At-least-once execution with SKIP LOCKED |
-| **Workflows** | DAG support with fan-out, conditionals, sub-workflows |
+| **Workflows** | DAG with parallel, conditional, fan-out steps |
+| **Map/Reduce** | Process items in parallel with aggregation |
 | **Step rerun** | Rerun failed workflow steps from any point |
 | **Dashboard** | React UI for monitoring jobs and workflows |
 
@@ -86,6 +87,15 @@ type Client interface {
     StartWorkflow(ctx context.Context, name string, input any) (*WorkflowRun, error)
     RerunWorkflowStep(ctx context.Context, runID int64, stepID string) error
 }
+
+type Workflow interface {
+    Step(id string, fn WorkflowFunc) *Workflow
+    Parallel(steps ...ParallelStep) *Workflow
+    If(cond func(*WorkflowContext) bool, fn WorkflowFunc) *Workflow
+    HandlerStep(handlerID, stepID string) *Workflow
+    Map(id string, items ItemsFunc, mapper MapFunc) *Workflow
+    MapReduce(id string, items ItemsFunc, mapper MapFunc, reducer ReduceFunc) *Workflow
+}
 ```
 
 ## Jobs
@@ -142,6 +152,39 @@ workflow := rivo.NewWorkflow("user-onboarding").
     HandlerStep("send-email", "send-welcome-email").
     HandlerStep("send-email", "send-verification-email").
     Build()
+```
+
+### Map / MapReduce
+
+Process items in parallel with optional aggregation:
+
+```go
+// Map: transform items in parallel
+workflow := rivo.NewWorkflow("batch-process").
+    Map("process-users",
+        func(ctx *rivo.WorkflowContext) ([]any, error) {
+            return []any{"user1", "user2", "user3"}, nil
+        },
+        func(ctx *rivo.WorkflowContext, item any, idx int) (any, error) {
+            return processUser(item.(string)), nil
+        },
+    ).Build()
+
+// MapReduce: transform then aggregate
+workflow := rivo.NewWorkflow("calculate-stats").
+    MapReduce("sum-values",
+        func(ctx *rivo.WorkflowContext) ([]any, error) {
+            return []any{10, 20, 30}, nil
+        },
+        func(ctx *rivo.WorkflowContext, item any, idx int) (any, error) {
+            return item.(int) * 2, nil  // map: double each
+        },
+        func(ctx *rivo.WorkflowContext, results []any) (any, error) {
+            sum := 0
+            for _, r := range results { sum += r.(int) }
+            return sum, nil  // reduce: sum all
+        },
+    ).Build()
 ```
 
 ## API

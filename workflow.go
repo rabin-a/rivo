@@ -203,35 +203,25 @@ func (w *Workflow) HandlerStep(handlerID string, stepID string, opts ...StepOpti
 	return w
 }
 
-// ForEach adds a fan-out step that processes items in parallel.
-// It retrieves items using itemsFunc, processes each with mapFunc, and optionally
-// reduces the results with reduceFunc.
+// Map processes items in parallel, returning an array of results.
+// Use this for transforming a list of items concurrently.
 //
 // Example:
 //
-//	workflow.ForEach(
-//	    "process-orders",
+//	workflow.Map("send-emails",
 //	    func(ctx *WorkflowContext) ([]any, error) {
-//	        // Get order IDs from previous step output
-//	        var prevOutput struct{ OrderIDs []string }
-//	        ctx.GetStepOutput("get-orders", &prevOutput)
-//	        items := make([]any, len(prevOutput.OrderIDs))
-//	        for i, id := range prevOutput.OrderIDs {
-//	            items[i] = id
-//	        }
+//	        var input struct{ Users []string }
+//	        ctx.Input(&input)
+//	        items := make([]any, len(input.Users))
+//	        for i, u := range input.Users { items[i] = u }
 //	        return items, nil
 //	    },
 //	    func(ctx *WorkflowContext, item any, index int) (any, error) {
-//	        orderID := item.(string)
-//	        // Process each order
-//	        return map[string]any{"order_id": orderID, "processed": true}, nil
+//	        email := item.(string)
+//	        return sendEmail(email), nil
 //	    },
-//	    WithReducer(func(ctx *WorkflowContext, results []any) (any, error) {
-//	        // Summarize all results
-//	        return map[string]any{"total_processed": len(results)}, nil
-//	    }),
 //	)
-func (w *Workflow) ForEach(
+func (w *Workflow) Map(
 	id string,
 	itemsFunc func(ctx *WorkflowContext) ([]any, error),
 	mapFunc func(ctx *WorkflowContext, item any, index int) (any, error),
@@ -255,6 +245,62 @@ func (w *Workflow) ForEach(
 
 	w.steps = append(w.steps, step)
 	return w
+}
+
+// MapReduce processes items in parallel then aggregates results.
+// Combines Map and Reduce into a single step.
+//
+// Example:
+//
+//	workflow.MapReduce("calculate-totals",
+//	    func(ctx *WorkflowContext) ([]any, error) {
+//	        return []any{1, 2, 3, 4, 5}, nil
+//	    },
+//	    func(ctx *WorkflowContext, item any, index int) (any, error) {
+//	        return item.(int) * 2, nil  // Double each number
+//	    },
+//	    func(ctx *WorkflowContext, results []any) (any, error) {
+//	        sum := 0
+//	        for _, r := range results { sum += r.(int) }
+//	        return sum, nil  // Sum all results
+//	    },
+//	)
+func (w *Workflow) MapReduce(
+	id string,
+	itemsFunc func(ctx *WorkflowContext) ([]any, error),
+	mapFunc func(ctx *WorkflowContext, item any, index int) (any, error),
+	reduceFunc func(ctx *WorkflowContext, results []any) (any, error),
+	opts ...FanOutOption,
+) *Workflow {
+	config := &fanOutConfig{
+		ItemsFunc:  itemsFunc,
+		MapFunc:    mapFunc,
+		ReduceFunc: reduceFunc,
+	}
+
+	for _, opt := range opts {
+		opt(config)
+	}
+
+	step := workflowStep{
+		id:           id,
+		name:         id,
+		stepType:     stepTypeFanOut,
+		fanOutConfig: config,
+	}
+
+	w.steps = append(w.steps, step)
+	return w
+}
+
+// ForEach is an alias for Map. Processes items in parallel.
+func (w *Workflow) ForEach(
+	id string,
+	itemsFunc func(ctx *WorkflowContext) ([]any, error),
+	mapFunc func(ctx *WorkflowContext, item any, index int) (any, error),
+	opts ...FanOutOption,
+) *Workflow {
+	return w.Map(id, itemsFunc, mapFunc, opts...)
 }
 
 // FanOutOption configures a fan-out step.
