@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/rabin-a/rivo/blob/main/logo.svg" alt="Rivo" width="200"/>
+  <img src="https://raw.githubusercontent.com/rabin-a/rivo/main/logo.svg" alt="Rivo" width="200"/>
 </p>
 
 <h1 align="center">Rivo</h1>
