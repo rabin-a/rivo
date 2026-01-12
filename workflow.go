@@ -52,8 +52,11 @@ type workflowStep struct {
 	retryPolicy *RetryPolicy
 	timeout     time.Duration
 
-	// Fan-out configuration
+	// Fan-out configuration (Map)
 	fanOutConfig *fanOutConfig
+
+	// Reduce configuration
+	reduceConfig *reduceConfig
 
 	// Handler step configuration (uses job handler)
 	handlerID string
@@ -68,12 +71,17 @@ type fanOutConfig struct {
 	// MapFunc processes each item and returns the result.
 	MapFunc func(ctx *WorkflowContext, item any, index int) (any, error)
 
-	// ReduceFunc aggregates all mapped results into final output.
-	// If nil, results are returned as an array.
-	ReduceFunc func(ctx *WorkflowContext, results []any) (any, error)
-
 	// MaxConcurrency limits parallel execution (0 = unlimited).
 	MaxConcurrency int
+}
+
+// reduceConfig contains configuration for reduce steps.
+type reduceConfig struct {
+	// SourceStepID is the step whose output will be reduced.
+	SourceStepID string
+
+	// ReduceFunc aggregates the array results into a single value.
+	ReduceFunc func(ctx *WorkflowContext, results []any) (any, error)
 }
 
 type stepType int
@@ -82,7 +90,8 @@ const (
 	stepTypeSequential stepType = iota
 	stepTypeParallel
 	stepTypeConditional
-	stepTypeFanOut  // Dynamic parallel expansion
+	stepTypeFanOut  // Dynamic parallel expansion (Map)
+	stepTypeReduce  // Aggregates results from previous step
 	stepTypeHandler // Uses job handler
 )
 
@@ -247,46 +256,40 @@ func (w *Workflow) Map(
 	return w
 }
 
-// MapReduce processes items in parallel then aggregates results.
-// Combines Map and Reduce into a single step.
+// Reduce aggregates results from a previous Map step.
+// Takes the array output from the previous step and reduces it to a single value.
 //
 // Example:
 //
-//	workflow.MapReduce("calculate-totals",
-//	    func(ctx *WorkflowContext) ([]any, error) {
-//	        return []any{1, 2, 3, 4, 5}, nil
-//	    },
-//	    func(ctx *WorkflowContext, item any, index int) (any, error) {
-//	        return item.(int) * 2, nil  // Double each number
-//	    },
-//	    func(ctx *WorkflowContext, results []any) (any, error) {
-//	        sum := 0
-//	        for _, r := range results { sum += r.(int) }
-//	        return sum, nil  // Sum all results
-//	    },
-//	)
-func (w *Workflow) MapReduce(
+//	workflow.
+//	    Map("double-values",
+//	        func(ctx *WorkflowContext) ([]any, error) {
+//	            return []any{1, 2, 3, 4, 5}, nil
+//	        },
+//	        func(ctx *WorkflowContext, item any, index int) (any, error) {
+//	            return item.(int) * 2, nil
+//	        },
+//	    ).
+//	    Reduce("sum-all", "double-values",
+//	        func(ctx *WorkflowContext, results []any) (any, error) {
+//	            sum := 0
+//	            for _, r := range results { sum += r.(int) }
+//	            return sum, nil
+//	        },
+//	    )
+func (w *Workflow) Reduce(
 	id string,
-	itemsFunc func(ctx *WorkflowContext) ([]any, error),
-	mapFunc func(ctx *WorkflowContext, item any, index int) (any, error),
+	sourceStepID string,
 	reduceFunc func(ctx *WorkflowContext, results []any) (any, error),
-	opts ...FanOutOption,
 ) *Workflow {
-	config := &fanOutConfig{
-		ItemsFunc:  itemsFunc,
-		MapFunc:    mapFunc,
-		ReduceFunc: reduceFunc,
-	}
-
-	for _, opt := range opts {
-		opt(config)
-	}
-
 	step := workflowStep{
-		id:           id,
-		name:         id,
-		stepType:     stepTypeFanOut,
-		fanOutConfig: config,
+		id:       id,
+		name:     id,
+		stepType: stepTypeReduce,
+		reduceConfig: &reduceConfig{
+			SourceStepID: sourceStepID,
+			ReduceFunc:   reduceFunc,
+		},
 	}
 
 	w.steps = append(w.steps, step)
@@ -303,15 +306,8 @@ func (w *Workflow) ForEach(
 	return w.Map(id, itemsFunc, mapFunc, opts...)
 }
 
-// FanOutOption configures a fan-out step.
+// FanOutOption configures a fan-out (Map) step.
 type FanOutOption func(*fanOutConfig)
-
-// WithReducer sets a reducer function to aggregate fan-out results.
-func WithReducer(fn func(ctx *WorkflowContext, results []any) (any, error)) FanOutOption {
-	return func(c *fanOutConfig) {
-		c.ReduceFunc = fn
-	}
-}
 
 // WithMaxConcurrency limits the number of concurrent fan-out executions.
 func WithMaxConcurrency(max int) FanOutOption {

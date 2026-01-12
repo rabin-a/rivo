@@ -40,6 +40,7 @@ const (
 	StepTypeParallel
 	StepTypeConditional
 	StepTypeFanOut
+	StepTypeReduce
 	StepTypeHandler
 )
 
@@ -64,6 +65,8 @@ func (s *StepType) UnmarshalJSON(data []byte) error {
 		*s = StepTypeConditional
 	case "fanout":
 		*s = StepTypeFanOut
+	case "reduce":
+		*s = StepTypeReduce
 	case "handler":
 		*s = StepTypeHandler
 	default:
@@ -84,6 +87,8 @@ func (s StepType) MarshalJSON() ([]byte, error) {
 		str = "conditional"
 	case StepTypeFanOut:
 		str = "fanout"
+	case StepTypeReduce:
+		str = "reduce"
 	case StepTypeHandler:
 		str = "handler"
 	default:
@@ -100,7 +105,8 @@ type StepDefinition struct {
 	Children     []StepDefinition `json:"children,omitempty"`
 	HasCondition bool             `json:"has_condition,omitempty"`
 	Timeout      time.Duration    `json:"timeout,omitempty"`
-	HandlerID    string           `json:"handler_id,omitempty"` // For handler steps
+	HandlerID    string           `json:"handler_id,omitempty"`    // For handler steps
+	SourceStepID string           `json:"source_step_id,omitempty"` // For reduce steps
 }
 
 // WorkflowDefinition represents the serializable workflow definition.
@@ -198,15 +204,19 @@ func (c *Context) Log() Logger {
 // HandlerStepExecutor executes a job handler as a workflow step.
 type HandlerStepExecutor func(ctx context.Context, handlerID string, input json.RawMessage) (json.RawMessage, error)
 
+// ReduceHandler aggregates results from a previous step.
+type ReduceHandler func(ctx *Context, results []any) (any, error)
+
 // Engine executes workflows.
 type Engine struct {
 	db                   *db.DB
 	namespace            string
 	workerID             string
-	handlers             map[string]map[string]StepHandler   // workflow -> step -> handler
-	conditions           map[string]map[string]ConditionFunc // workflow -> step -> condition
-	fanOutHandlers       map[string]map[string]FanOutHandler // workflow -> step -> fanout handler
-	handlerStepExecutor  HandlerStepExecutor                 // Executes job handlers as steps
+	handlers             map[string]map[string]StepHandler    // workflow -> step -> handler
+	conditions           map[string]map[string]ConditionFunc  // workflow -> step -> condition
+	fanOutHandlers       map[string]map[string]FanOutHandler  // workflow -> step -> fanout handler
+	reduceHandlers       map[string]map[string]ReduceHandler  // workflow -> step -> reduce handler
+	handlerStepExecutor  HandlerStepExecutor                  // Executes job handlers as steps
 	mu                   sync.RWMutex
 }
 
@@ -218,6 +228,7 @@ func NewEngine(database *db.DB, namespace string) *Engine {
 		handlers:       make(map[string]map[string]StepHandler),
 		conditions:     make(map[string]map[string]ConditionFunc),
 		fanOutHandlers: make(map[string]map[string]FanOutHandler),
+		reduceHandlers: make(map[string]map[string]ReduceHandler),
 	}
 }
 
@@ -344,6 +355,8 @@ func (e *Engine) executeStep(
 		return e.executeConditionalStep(ctx, runID, workflowName, step, input, state, stepStates, logger)
 	case StepTypeFanOut:
 		return e.executeFanOutStep(ctx, runID, workflowName, step, input, state, stepStates, logger)
+	case StepTypeReduce:
+		return e.executeReduceStep(ctx, runID, workflowName, step, input, state, stepStates, logger)
 	case StepTypeHandler:
 		return e.executeHandlerStep(ctx, runID, workflowName, step, input, state, stepStates, logger)
 	default:
@@ -517,11 +530,10 @@ func (e *Engine) executeConditionalStep(
 	return e.executeSequentialStep(ctx, runID, workflowName, step, input, state, stepStates, logger)
 }
 
-// FanOutHandler handles fan-out step execution.
+// FanOutHandler handles fan-out (Map) step execution.
 type FanOutHandler struct {
 	ItemsFunc      func(ctx *Context) ([]any, error)
 	MapFunc        func(ctx *Context, item any, index int) (any, error)
-	ReduceFunc     func(ctx *Context, results []any) (any, error)
 	MaxConcurrency int
 }
 
@@ -537,6 +549,20 @@ func (e *Engine) RegisterFanOut(workflowName, stepID string, handler FanOutHandl
 		e.fanOutHandlers[workflowName] = make(map[string]FanOutHandler)
 	}
 	e.fanOutHandlers[workflowName][stepID] = handler
+}
+
+// RegisterReduce registers a reduce handler for a workflow step.
+func (e *Engine) RegisterReduce(workflowName, stepID string, handler ReduceHandler) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.reduceHandlers == nil {
+		e.reduceHandlers = make(map[string]map[string]ReduceHandler)
+	}
+	if e.reduceHandlers[workflowName] == nil {
+		e.reduceHandlers[workflowName] = make(map[string]ReduceHandler)
+	}
+	e.reduceHandlers[workflowName][stepID] = handler
 }
 
 func (e *Engine) executeFanOutStep(
@@ -633,28 +659,8 @@ func (e *Engine) executeFanOutStep(
 		return err
 	}
 
-	// Run reduce function if provided
-	var finalOutput any
-	if handler.ReduceFunc != nil {
-		reduceCtx := NewContext(ctx, runID, step.ID, input, state, logger)
-		finalOutput, err = handler.ReduceFunc(reduceCtx, results)
-		if err != nil {
-			completedAt := time.Now()
-			stepStates[step.ID] = StepRunState{
-				State:       StepStateFailed,
-				Error:       err.Error(),
-				Attempt:     1,
-				StartedAt:   &now,
-				CompletedAt: &completedAt,
-			}
-			return fmt.Errorf("reduce failed for step %s: %w", step.ID, err)
-		}
-	} else {
-		finalOutput = results
-	}
-
-	// Marshal output
-	outputData, err := json.Marshal(finalOutput)
+	// Marshal results array as output
+	outputData, err := json.Marshal(results)
 	if err != nil {
 		return fmt.Errorf("marshal fan-out output: %w", err)
 	}
@@ -671,6 +677,84 @@ func (e *Engine) executeFanOutStep(
 	}
 
 	logger.Info("fan-out step completed", "step", step.ID, "items_processed", len(items))
+	return nil
+}
+
+func (e *Engine) executeReduceStep(
+	ctx context.Context,
+	runID int64,
+	workflowName string,
+	step StepDefinition,
+	input json.RawMessage,
+	state map[string]json.RawMessage,
+	stepStates map[string]StepRunState,
+	logger Logger,
+) error {
+	e.mu.RLock()
+	reduceHandlers := e.reduceHandlers[workflowName]
+	handler, ok := reduceHandlers[step.ID]
+	e.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("reduce handler not found for step: %s", step.ID)
+	}
+
+	// Get source step output
+	sourceOutput, exists := state[step.SourceStepID]
+	if !exists {
+		return fmt.Errorf("source step output not found: %s", step.SourceStepID)
+	}
+
+	// Parse source output as array
+	var results []any
+	if err := json.Unmarshal(sourceOutput, &results); err != nil {
+		return fmt.Errorf("source step output is not an array: %w", err)
+	}
+
+	// Mark step as running
+	now := time.Now()
+	stepStates[step.ID] = StepRunState{
+		State:     StepStateRunning,
+		Attempt:   1,
+		StartedAt: &now,
+	}
+
+	// Create step context
+	stepCtx := NewContext(ctx, runID, step.ID, input, state, logger)
+
+	// Execute reduce
+	logger.Info("executing reduce step", "step", step.ID, "source", step.SourceStepID, "items", len(results))
+	result, err := handler(stepCtx, results)
+	if err != nil {
+		completedAt := time.Now()
+		stepStates[step.ID] = StepRunState{
+			State:       StepStateFailed,
+			Error:       err.Error(),
+			Attempt:     1,
+			StartedAt:   &now,
+			CompletedAt: &completedAt,
+		}
+		return fmt.Errorf("reduce step %s failed: %w", step.ID, err)
+	}
+
+	// Marshal output
+	outputData, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal reduce output: %w", err)
+	}
+	state[step.ID] = outputData
+
+	// Mark step as completed
+	completedAt := time.Now()
+	stepStates[step.ID] = StepRunState{
+		State:       StepStateCompleted,
+		Output:      outputData,
+		Attempt:     1,
+		StartedAt:   &now,
+		CompletedAt: &completedAt,
+	}
+
+	logger.Info("reduce step completed", "step", step.ID)
 	return nil
 }
 

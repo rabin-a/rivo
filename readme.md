@@ -94,7 +94,7 @@ type Workflow interface {
     If(cond func(*WorkflowContext) bool, fn WorkflowFunc) *Workflow
     HandlerStep(handlerID, stepID string) *Workflow
     Map(id string, items ItemsFunc, mapper MapFunc) *Workflow
-    MapReduce(id string, items ItemsFunc, mapper MapFunc, reducer ReduceFunc) *Workflow
+    Reduce(id, sourceStepID string, reducer ReduceFunc) *Workflow
 }
 ```
 
@@ -154,35 +154,25 @@ workflow := rivo.NewWorkflow("user-onboarding").
     Build()
 ```
 
-### Map / MapReduce
+### Map / Reduce
 
-Process items in parallel with optional aggregation:
+Process items in parallel, then aggregate:
 
 ```go
-// Map: transform items in parallel
-workflow := rivo.NewWorkflow("batch-process").
-    Map("process-users",
-        func(ctx *rivo.WorkflowContext) ([]any, error) {
-            return []any{"user1", "user2", "user3"}, nil
-        },
-        func(ctx *rivo.WorkflowContext, item any, idx int) (any, error) {
-            return processUser(item.(string)), nil
-        },
-    ).Build()
-
-// MapReduce: transform then aggregate
 workflow := rivo.NewWorkflow("calculate-stats").
-    MapReduce("sum-values",
+    Map("double-values",
         func(ctx *rivo.WorkflowContext) ([]any, error) {
-            return []any{10, 20, 30}, nil
+            return []any{1, 2, 3, 4, 5}, nil
         },
         func(ctx *rivo.WorkflowContext, item any, idx int) (any, error) {
-            return item.(int) * 2, nil  // map: double each
+            return item.(int) * 2, nil  // [2, 4, 6, 8, 10]
         },
+    ).
+    Reduce("sum-all", "double-values",
         func(ctx *rivo.WorkflowContext, results []any) (any, error) {
             sum := 0
             for _, r := range results { sum += r.(int) }
-            return sum, nil  // reduce: sum all
+            return sum, nil  // 30
         },
     ).Build()
 ```

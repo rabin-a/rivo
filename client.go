@@ -580,7 +580,7 @@ func (c *Client) registerWorkflowStep(workflowName string, step workflowStep) {
 		})
 	}
 
-	// Register fan-out handler
+	// Register fan-out (Map) handler
 	if step.fanOutConfig != nil {
 		c.workflowEngine.RegisterFanOut(workflowName, step.id, workflow.FanOutHandler{
 			ItemsFunc: func(ctx *workflow.Context) ([]any, error) {
@@ -591,14 +591,15 @@ func (c *Client) registerWorkflowStep(workflowName string, step workflowStep) {
 				wfCtx := c.createWorkflowContext(ctx, workflowName)
 				return step.fanOutConfig.MapFunc(wfCtx, item, index)
 			},
-			ReduceFunc: func(ctx *workflow.Context, results []any) (any, error) {
-				if step.fanOutConfig.ReduceFunc == nil {
-					return results, nil
-				}
-				wfCtx := c.createWorkflowContext(ctx, workflowName)
-				return step.fanOutConfig.ReduceFunc(wfCtx, results)
-			},
 			MaxConcurrency: step.fanOutConfig.MaxConcurrency,
+		})
+	}
+
+	// Register reduce handler
+	if step.reduceConfig != nil {
+		c.workflowEngine.RegisterReduce(workflowName, step.id, func(ctx *workflow.Context, results []any) (any, error) {
+			wfCtx := c.createWorkflowContext(ctx, workflowName)
+			return step.reduceConfig.ReduceFunc(wfCtx, results)
 		})
 	}
 }
@@ -705,6 +706,7 @@ type workflowStepDef struct {
 	HasCondition bool              `json:"has_condition,omitempty"`
 	Timeout      string            `json:"timeout,omitempty"`
 	HandlerID    string            `json:"handler_id,omitempty"`
+	SourceStepID string            `json:"source_step_id,omitempty"`
 }
 
 func (c *Client) serializeStep(s workflowStep) workflowStepDef {
@@ -727,6 +729,11 @@ func (c *Client) serializeStep(s workflowStep) workflowStepDef {
 		def.Type = "conditional"
 	case stepTypeFanOut:
 		def.Type = "fanout"
+	case stepTypeReduce:
+		def.Type = "reduce"
+		if s.reduceConfig != nil {
+			def.SourceStepID = s.reduceConfig.SourceStepID
+		}
 	case stepTypeHandler:
 		def.Type = "handler"
 		def.HandlerID = s.handlerID
