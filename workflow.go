@@ -52,8 +52,11 @@ type workflowStep struct {
 	retryPolicy *RetryPolicy
 	timeout     time.Duration
 
-	// Fan-out configuration (Map)
+	// Fan-out configuration (ForEach)
 	fanOutConfig *fanOutConfig
+
+	// Map function (returns array)
+	mapFunc func(ctx *WorkflowContext) ([]any, error)
 
 	// Reduce configuration
 	reduceConfig *reduceConfig
@@ -77,11 +80,11 @@ type fanOutConfig struct {
 
 // reduceConfig contains configuration for reduce steps.
 type reduceConfig struct {
-	// SourceStepID is the step whose output will be reduced.
+	// SourceStepID is the step whose output will be reduced (auto-set to previous step).
 	SourceStepID string
 
-	// ReduceFunc aggregates the array results into a single value.
-	ReduceFunc func(ctx *WorkflowContext, results []any) (any, error)
+	// ReduceFunc aggregates the results. Use ctx.GetPreviousOutput() to get input.
+	ReduceFunc func(ctx *WorkflowContext) (any, error)
 }
 
 type stepType int
@@ -90,7 +93,8 @@ const (
 	stepTypeSequential stepType = iota
 	stepTypeParallel
 	stepTypeConditional
-	stepTypeFanOut  // Dynamic parallel expansion (Map)
+	stepTypeFanOut  // Dynamic parallel expansion (ForEach)
+	stepTypeMap     // Returns array of results
 	stepTypeReduce  // Aggregates results from previous step
 	stepTypeHandler // Uses job handler
 )
@@ -212,98 +216,70 @@ func (w *Workflow) HandlerStep(handlerID string, stepID string, opts ...StepOpti
 	return w
 }
 
-// Map processes items in parallel, returning an array of results.
-// Use this for transforming a list of items concurrently.
+// Map transforms input into an array of results.
+// The function receives context and returns an array.
 //
 // Example:
 //
-//	workflow.Map("send-emails",
-//	    func(ctx *WorkflowContext) ([]any, error) {
-//	        var input struct{ Users []string }
-//	        ctx.Input(&input)
-//	        items := make([]any, len(input.Users))
-//	        for i, u := range input.Users { items[i] = u }
-//	        return items, nil
-//	    },
-//	    func(ctx *WorkflowContext, item any, index int) (any, error) {
-//	        email := item.(string)
-//	        return sendEmail(email), nil
-//	    },
-//	)
+//	workflow.Map("get-users", func(ctx *WorkflowContext) ([]any, error) {
+//	    return []any{
+//	        map[string]any{"id": 1, "name": "Alice"},
+//	        map[string]any{"id": 2, "name": "Bob"},
+//	    }, nil
+//	})
 func (w *Workflow) Map(
 	id string,
-	itemsFunc func(ctx *WorkflowContext) ([]any, error),
-	mapFunc func(ctx *WorkflowContext, item any, index int) (any, error),
-	opts ...FanOutOption,
+	fn func(ctx *WorkflowContext) ([]any, error),
 ) *Workflow {
-	config := &fanOutConfig{
-		ItemsFunc: itemsFunc,
-		MapFunc:   mapFunc,
-	}
-
-	for _, opt := range opts {
-		opt(config)
-	}
-
 	step := workflowStep{
-		id:           id,
-		name:         id,
-		stepType:     stepTypeFanOut,
-		fanOutConfig: config,
+		id:       id,
+		name:     id,
+		stepType: stepTypeMap,
+		mapFunc:  fn,
 	}
 
 	w.steps = append(w.steps, step)
 	return w
 }
 
-// Reduce aggregates results from a previous Map step.
-// Takes the array output from the previous step and reduces it to a single value.
+// Reduce aggregates results from the previous step.
+// Use ctx.GetPreviousOutput() to get the array from the previous Map step.
 //
 // Example:
 //
 //	workflow.
-//	    Map("double-values",
-//	        func(ctx *WorkflowContext) ([]any, error) {
-//	            return []any{1, 2, 3, 4, 5}, nil
-//	        },
-//	        func(ctx *WorkflowContext, item any, index int) (any, error) {
-//	            return item.(int) * 2, nil
-//	        },
-//	    ).
-//	    Reduce("sum-all", "double-values",
-//	        func(ctx *WorkflowContext, results []any) (any, error) {
-//	            sum := 0
-//	            for _, r := range results { sum += r.(int) }
-//	            return sum, nil
-//	        },
-//	    )
+//	    Map("get-values", func(ctx *WorkflowContext) ([]any, error) {
+//	        return []any{1, 2, 3, 4, 5}, nil
+//	    }).
+//	    Reduce("sum", func(ctx *WorkflowContext) (any, error) {
+//	        var values []int
+//	        ctx.GetPreviousOutput(&values)
+//	        sum := 0
+//	        for _, v := range values { sum += v }
+//	        return sum, nil
+//	    })
 func (w *Workflow) Reduce(
 	id string,
-	sourceStepID string,
-	reduceFunc func(ctx *WorkflowContext, results []any) (any, error),
+	fn func(ctx *WorkflowContext) (any, error),
 ) *Workflow {
+	// Get the previous step ID
+	var prevStepID string
+	if len(w.steps) > 0 {
+		prevStepID = w.steps[len(w.steps)-1].id
+	}
+
 	step := workflowStep{
 		id:       id,
 		name:     id,
 		stepType: stepTypeReduce,
 		reduceConfig: &reduceConfig{
-			SourceStepID: sourceStepID,
-			ReduceFunc:   reduceFunc,
+			SourceStepID: prevStepID,
+			ReduceFunc:   fn,
 		},
 	}
 
 	w.steps = append(w.steps, step)
 	return w
-}
-
-// ForEach is an alias for Map. Processes items in parallel.
-func (w *Workflow) ForEach(
-	id string,
-	itemsFunc func(ctx *WorkflowContext) ([]any, error),
-	mapFunc func(ctx *WorkflowContext, item any, index int) (any, error),
-	opts ...FanOutOption,
-) *Workflow {
-	return w.Map(id, itemsFunc, mapFunc, opts...)
 }
 
 // FanOutOption configures a fan-out (Map) step.
@@ -372,12 +348,16 @@ type ParallelStep struct {
 // WorkflowContext provides context for workflow step execution.
 type WorkflowContext struct {
 	context.Context
-	runID    int64
-	stepID   string
-	workflow *Workflow
-	input    json.RawMessage
-	state    map[string]json.RawMessage // Step outputs keyed by step ID
-	logger   *JobLogger
+	runID          int64
+	stepID         string
+	previousStepID string
+	workflow       *Workflow
+	input          json.RawMessage
+	state          map[string]json.RawMessage // Step outputs keyed by step ID
+	logger         *JobLogger
+	engineCtx      interface {
+		GetStepOutput(stepID string, v any) error
+	}
 }
 
 // RunID returns the workflow run ID.
@@ -397,11 +377,25 @@ func (c *WorkflowContext) Input(v any) error {
 
 // GetStepOutput retrieves the output from a previous step.
 func (c *WorkflowContext) GetStepOutput(stepID string, v any) error {
+	// Try engine context first (has actual state)
+	if c.engineCtx != nil {
+		return c.engineCtx.GetStepOutput(stepID, v)
+	}
+	// Fallback to local state
 	data, ok := c.state[stepID]
 	if !ok {
 		return fmt.Errorf("step output not found: %s", stepID)
 	}
 	return json.Unmarshal(data, v)
+}
+
+// GetPreviousOutput retrieves the output from the previous step.
+// Useful in Reduce steps to get the Map output.
+func (c *WorkflowContext) GetPreviousOutput(v any) error {
+	if c.previousStepID == "" {
+		return fmt.Errorf("no previous step")
+	}
+	return c.GetStepOutput(c.previousStepID, v)
 }
 
 // SetOutput sets the output for the current step.

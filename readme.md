@@ -93,8 +93,8 @@ type Workflow interface {
     Parallel(steps ...ParallelStep) *Workflow
     If(cond func(*WorkflowContext) bool, fn WorkflowFunc) *Workflow
     HandlerStep(handlerID, stepID string) *Workflow
-    Map(id string, items ItemsFunc, mapper MapFunc) *Workflow
-    Reduce(id, sourceStepID string, reducer ReduceFunc) *Workflow
+    Map(id string, fn func(*WorkflowContext) ([]any, error)) *Workflow
+    Reduce(id string, fn func(*WorkflowContext) (any, error)) *Workflow
 }
 ```
 
@@ -156,25 +156,22 @@ workflow := rivo.NewWorkflow("user-onboarding").
 
 ### Map / Reduce
 
-Process items in parallel, then aggregate:
+Process items, then aggregate with `GetPreviousOutput()`:
 
 ```go
-workflow := rivo.NewWorkflow("calculate-stats").
-    Map("double-values",
-        func(ctx *rivo.WorkflowContext) ([]any, error) {
-            return []any{1, 2, 3, 4, 5}, nil
-        },
-        func(ctx *rivo.WorkflowContext, item any, idx int) (any, error) {
-            return item.(int) * 2, nil  // [2, 4, 6, 8, 10]
-        },
-    ).
-    Reduce("sum-all", "double-values",
-        func(ctx *rivo.WorkflowContext, results []any) (any, error) {
-            sum := 0
-            for _, r := range results { sum += r.(int) }
-            return sum, nil  // 30
-        },
-    ).Build()
+workflow := rivo.NewWorkflow("data-pipeline").
+    Map("get-items", func(ctx *rivo.WorkflowContext) ([]any, error) {
+        return []any{
+            map[string]any{"a": 1},
+            map[string]any{"b": 2},
+        }, nil
+    }).
+    Reduce("sum", func(ctx *rivo.WorkflowContext) (any, error) {
+        var items []map[string]any
+        ctx.GetPreviousOutput(&items)
+        fmt.Println("Processing", len(items), "items")
+        return map[string]any{"total": len(items)}, nil
+    }).Build()
 ```
 
 ## API

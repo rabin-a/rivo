@@ -580,7 +580,7 @@ func (c *Client) registerWorkflowStep(workflowName string, step workflowStep) {
 		})
 	}
 
-	// Register fan-out (Map) handler
+	// Register fan-out (ForEach) handler
 	if step.fanOutConfig != nil {
 		c.workflowEngine.RegisterFanOut(workflowName, step.id, workflow.FanOutHandler{
 			ItemsFunc: func(ctx *workflow.Context) ([]any, error) {
@@ -595,11 +595,19 @@ func (c *Client) registerWorkflowStep(workflowName string, step workflowStep) {
 		})
 	}
 
+	// Register map handler
+	if step.mapFunc != nil {
+		c.workflowEngine.RegisterMap(workflowName, step.id, func(ctx *workflow.Context) ([]any, error) {
+			wfCtx := c.createWorkflowContext(ctx, workflowName)
+			return step.mapFunc(wfCtx)
+		})
+	}
+
 	// Register reduce handler
 	if step.reduceConfig != nil {
-		c.workflowEngine.RegisterReduce(workflowName, step.id, func(ctx *workflow.Context, results []any) (any, error) {
+		c.workflowEngine.RegisterReduce(workflowName, step.id, func(ctx *workflow.Context) (any, error) {
 			wfCtx := c.createWorkflowContext(ctx, workflowName)
-			return step.reduceConfig.ReduceFunc(wfCtx, results)
+			return step.reduceConfig.ReduceFunc(wfCtx)
 		})
 	}
 }
@@ -607,12 +615,14 @@ func (c *Client) registerWorkflowStep(workflowName string, step workflowStep) {
 // createWorkflowContext creates a WorkflowContext from workflow.Context.
 func (c *Client) createWorkflowContext(ctx *workflow.Context, workflowName string) *WorkflowContext {
 	wfCtx := &WorkflowContext{
-		Context:  ctx.Context,
-		runID:    ctx.RunID(),
-		stepID:   ctx.StepID(),
-		workflow: c.workflows[workflowName],
-		state:    make(map[string]json.RawMessage),
-		logger:   NewJobLogger(),
+		Context:        ctx.Context,
+		runID:          ctx.RunID(),
+		stepID:         ctx.StepID(),
+		previousStepID: ctx.PreviousStepID(),
+		workflow:       c.workflows[workflowName],
+		state:          make(map[string]json.RawMessage),
+		logger:         NewJobLogger(),
+		engineCtx:      ctx, // Store engine context for state access
 	}
 
 	// Copy input
@@ -729,6 +739,8 @@ func (c *Client) serializeStep(s workflowStep) workflowStepDef {
 		def.Type = "conditional"
 	case stepTypeFanOut:
 		def.Type = "fanout"
+	case stepTypeMap:
+		def.Type = "map"
 	case stepTypeReduce:
 		def.Type = "reduce"
 		if s.reduceConfig != nil {
